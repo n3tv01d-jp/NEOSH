@@ -1,0 +1,38 @@
+# neosh is plain bash: everything the project needs is install.sh,
+# uninstall.sh, lib/, share/, assets/, tests/, README.md, LICENSE, VERSION.
+
+# Installer / uninstaller leftovers (if run with HOME pointed at the repo)
+.neosh-stage.*/
+neosh.old.*/
+.bashrc.neosh.*
+.bashrc.neosh-backup.*
+install.manifest
+
+# Test runs and local experiments
+neosh-test.*/
+.selftest/
+scratch/
+*.tmp
+
+# Personal config: the shipped default lives in share/neosh.conf
+/neosh.conf
+.config/
+
+# Rendered previews of the banner (assets/neosh.svg is the source)
+assets/*.png
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.#*
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Logs / scratch
+*.log
+*.pid

@@ -1,0 +1,7 @@
+# shellcheck shell=bash
+# rcfile used by the `neosh` launcher: your normal ~/.bashrc first (which
+# already sources /etc/bashrc on most distros), then the neosh layer.
+# shellcheck source=/dev/null
+[[ -f ~/.bashrc ]] && . ~/.bashrc
+# shellcheck source=neosh.bash
+[[ -n ${__NEOSH_LOADED-} ]] || . "${BASH_SOURCE[0]%/*}/neosh.bash"

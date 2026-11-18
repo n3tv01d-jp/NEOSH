@@ -54,7 +54,14 @@ main() {
         [[ -f $SRC/$f ]] || die "missing $f, so this doesn't look like a complete neosh checkout."
     done
     local THEMES='hearth redline mecha sakura eclipse kurenai abyss aurum specter'
-    if [[ -n $THEME && " $THEMES " != *" $THEME "* ]]; then die "unknown theme '$THEME' (choose: $THEMES)"; fi
+    local CONF_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/neosh/neosh.conf
+    if [[ -n $THEME && " $THEMES " != *" $THEME "* ]]; then
+        # a custom theme already defined in the config is fine too
+        if ! { [[ $THEME =~ ^[a-z][a-z0-9_]{0,15}$ && -f $CONF_FILE ]] &&
+               grep -Eq "^[[:space:]]*theme\.$THEME[[:space:]]*=" "$CONF_FILE"; }; then
+            die "unknown theme '$THEME' (choose: $THEMES, or one defined with neo theme add)"
+        fi
+    fi
     if [[ -n $BOOT && $BOOT != @(full|compact|off) ]]; then die "--boot must be full, compact or off"; fi
     "$BASH_BIN" -n "$SRC/lib/neosh.bash" || die "lib/neosh.bash has a syntax error."
     local VERSION
@@ -225,6 +232,7 @@ EOF
         printf 'backup=%s\n' "$BACKUP"
         printf 'launcher=%s\n' "$LAUNCHER"
         printf 'hook=%s\n' "$HOOKED"
+        printf 'source=%s\n' "$SRC"
     } > "$DATA/install.manifest"
 
     if [[ :$PATH: != *:"$BIN_DIR":* ]]; then
@@ -240,7 +248,8 @@ EOF
         say '(｀・ω・´)ゞ' "Installed without the hook. Run 'neosh' whenever you want the HUD."
     fi
     printf '\n   %sneo help%s      command deck\n' "$C_A1" "$C_R"
-    printf '   %sneo theme%s     pick one of 9 themes\n' "$C_A1" "$C_R"
+    printf '   %sneo preview%s   your prompt in all 9 themes\n' "$C_A1" "$C_R"
+    printf '   %s./update.sh%s   later: reinstall from this checkout (--pull: git pull first)\n' "$C_A1" "$C_R"
     printf '   %s./uninstall.sh%s  back to plain bash\n\n' "$C_A1" "$C_R"
 }
 

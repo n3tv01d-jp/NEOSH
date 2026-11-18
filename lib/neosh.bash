@@ -21,9 +21,14 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) ))
     return 0
 fi
 __NEOSH_LOADED=1
-NEOSH_VERSION=1.0.0
+NEOSH_VERSION=1.0.1
 NEOSH_HOME=${BASH_SOURCE[0]%/*}
 [[ $NEOSH_HOME == "${BASH_SOURCE[0]}" ]] && NEOSH_HOME=.
+# an install carries its VERSION file next to the runtime
+if [[ -r $NEOSH_HOME/VERSION ]] && IFS= read -r __neo_l < "$NEOSH_HOME/VERSION" && [[ $__neo_l =~ ^[0-9A-Za-z.+-]{1,32}$ ]]; then
+    NEOSH_VERSION=$__neo_l
+fi
+unset __neo_l
 NEOSH_CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/neosh/neosh.conf
 
 # ── themes (same palettes as HEARTH; accent roles a1/a2/a3, dim, faint) ──────
@@ -31,7 +36,8 @@ declare -gA __neo_theme_jp=(
     [hearth]=炉心 [redline]=赤警報 [mecha]=機甲 [sakura]=桜 [eclipse]=月蝕
     [kurenai]=紅 [abyss]=深海 [aurum]=黄金 [specter]=幽霊
 )
-__neo_theme_order=(hearth redline mecha sakura eclipse kurenai abyss aurum specter)
+__neo_theme_builtin=(hearth redline mecha sakura eclipse kurenai abyss aurum specter)
+__neo_theme_order=("${__neo_theme_builtin[@]}")   # + custom themes from the config
 declare -gA __neo_theme_rgb=(
     #           a1            a2            a3            dim           faint
     [hearth]="62,243,255   255,62,165   155,123,255  125,147,181  69,86,122"
@@ -51,7 +57,7 @@ __neo_status_rgb="93,255,158 255,182,62 255,59,92"
 declare -gA __neo_cfg=(
     [theme]=hearth [boot]=compact [color]=auto [glyphs]=auto [prompt]=on
     [navigator]=on [clock]=on [git]=on [git_dirty]=on [title]=on [spacing]=on
-    [duration]=3 [path_depth]=4
+    [duration]=3 [path_depth]=4 [shlvl]=on [quips]=on [transient]=off
 )
 
 # __neo_valid KEY VALUE → 0 if acceptable
@@ -61,40 +67,110 @@ __neo_valid() {
         boot)       [[ $2 == @(full|compact|off) ]] ;;
         color)      [[ $2 == @(auto|truecolor|256|off) ]] ;;
         glyphs)     [[ $2 == @(auto|unicode|ascii) ]] ;;
-        prompt|navigator|clock|git|git_dirty|title|spacing) [[ $2 == @(on|off) ]] ;;
+        prompt|navigator|clock|git|git_dirty|title|spacing|shlvl|quips|transient) [[ $2 == @(on|off) ]] ;;
         duration)   [[ $2 =~ ^[0-9]{1,4}$ ]] ;;
         path_depth) [[ $2 =~ ^[0-9]{1,2}$ ]] && (( 10#$2 >= 1 )) ;;
         *) return 1 ;;
     esac
 }
 
+# ── custom themes ────────────────────────────────────────────────────────────
+# A config line   theme.NAME = #a1 #a2 #a3 [#dim #faint]   defines a theme.
+# Like every other line it's parsed, never run: a name of [a-z0-9_] and 3 or 5
+# hex colours, or the line is ignored. Missing dim/faint are derived from a1.
+__neo_theme_max=32
+__neo_theme_reserved=' add new rm remove del '
+
+# "#rrggbb" or "rrggbb" → $__neo_s = "r,g,b"
+__neo_hex() {
+    [[ $1 =~ ^#?([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$ ]] || return 1
+    __neo_s="$((16#${BASH_REMATCH[1]})),$((16#${BASH_REMATCH[2]})),$((16#${BASH_REMATCH[3]}))"
+}
+
+# "c1 c2 c3 [c4 c5] [# comment]" → $__neo_s = five "r,g,b" words
+__neo_theme_parse() {
+    local -a w out=()
+    local x r g b
+    read -ra w <<< "$1"
+    for x in "${w[@]}"; do
+        if (( ${#out[@]} < 5 )) && __neo_hex "$x"; then out+=("$__neo_s")
+        elif [[ $x == \#* ]]; then break
+        else return 1; fi
+    done
+    if (( ${#out[@]} == 3 )); then
+        # dim: a1 pulled most of the way to slate grey; faint: a darker dim
+        IFS=, read -r r g b <<< "${out[0]}"
+        r=$(( (r * 30 + 140 * 70) / 100 )) g=$(( (g * 30 + 150 * 70) / 100 )) b=$(( (b * 30 + 175 * 70) / 100 ))
+        out+=("$r,$g,$b" "$(( r * 55 / 100 )),$(( g * 55 / 100 )),$(( b * 55 / 100 ))")
+    fi
+    (( ${#out[@]} == 5 )) || return 1
+    __neo_s="${out[*]}"
+}
+
+__neo_theme_name_ok() { # NAME → 0 if usable for a custom theme
+    [[ $1 =~ ^[a-z][a-z0-9_]{0,15}$ && $__neo_theme_reserved != *" $1 "* && -z ${__neo_theme_jp[$1]+x} ]]
+}
+
+# Forget custom themes (built-ins are the ones with a Japanese name).
+__neo_theme_reset() {
+    local t
+    for t in "${!__neo_theme_rgb[@]}"; do
+        [[ -n ${__neo_theme_jp[$t]+x} ]] || unset "__neo_theme_rgb[$t]"
+    done
+    __neo_theme_order=("${__neo_theme_builtin[@]}")
+}
+
 # The config is *parsed*, never sourced: only known keys with validated values
 # are accepted, so a tampered file can at worst change a colour.
 __neo_cfg_load() {
-    local f=$NEOSH_CONFIG line k v n=0
+    local f=$NEOSH_CONFIG line k v n=0 theme=
+    __neo_theme_reset
     if [[ ! -f $f || ! -r $f ]]; then :
     elif [[ ! -O $f ]]; then
         printf 'neosh: ignoring %s (not owned by you)\n' "$f" >&2
     else
     while IFS= read -r line || [[ -n $line ]]; do
         (( ++n > 500 )) && break
+        if [[ $line =~ ^[[:space:]]*theme\.([^=[:space:]]*)[[:space:]]*=(.*)$ ]]; then
+            k=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+            if ! __neo_theme_name_ok "$k"; then
+                __neo_clean "$k"; printf 'neosh: config: ignoring theme with a bad or taken name: %s\n' "$__neo_s" >&2
+            elif ! __neo_theme_parse "$v"; then
+                printf 'neosh: config: theme.%s needs 3 or 5 hex colours (#rrggbb)\n' "$k" >&2
+            elif [[ -z ${__neo_theme_rgb[$k]+x} ]] && (( ${#__neo_theme_order[@]} >= ${#__neo_theme_builtin[@]} + __neo_theme_max )); then
+                printf 'neosh: config: more than %d custom themes, ignoring theme.%s\n' "$__neo_theme_max" "$k" >&2
+            else
+                [[ -n ${__neo_theme_rgb[$k]+x} ]] || __neo_theme_order+=("$k")
+                __neo_theme_rgb[$k]=$__neo_s
+            fi
+            continue
+        fi
         line=${line%%#*}
         [[ $line =~ ^[[:space:]]*([a-z_]+)[[:space:]]*=[[:space:]]*([A-Za-z0-9_.-]*)[[:space:]]*$ ]] || continue
         k=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+        # theme= may name a custom theme defined further down: check it at the end
+        if [[ $k == theme ]]; then theme=$v; continue; fi
         if __neo_valid "$k" "$v"; then __neo_cfg[$k]=$v
         else printf 'neosh: config: ignoring bad value %s=%s\n' "$k" "$v" >&2; fi
     done < "$f"
     fi
+    if [[ -n $theme ]]; then
+        if __neo_valid theme "$theme"; then __neo_cfg[theme]=$theme
+        else printf 'neosh: config: unknown theme %s, using %s\n' "$theme" "${__neo_cfg[theme]}" >&2; fi
+    fi
     # environment overrides for one-off sessions, e.g. NEOSH_THEME=sakura bash
     [[ -n ${NEOSH_THEME-} ]] && __neo_valid theme "$NEOSH_THEME" && __neo_cfg[theme]=$NEOSH_THEME
     [[ -n ${NEOSH_BOOT-} ]] && __neo_valid boot "$NEOSH_BOOT" && __neo_cfg[boot]=$NEOSH_BOOT
+    # the active theme may have been a custom one that's gone now
+    __neo_valid theme "${__neo_cfg[theme]}" || __neo_cfg[theme]=hearth
     return 0
 }
 
-# Rewrite one key atomically (temp file in the same dir + rename).
-__neo_cfg_save() {
-    local key=$1 val=$2 f=$NEOSH_CONFIG dir tmp line found=0
-    __neo_valid "$key" "$val" || { printf 'neosh: invalid value for %s: %s\n' "$key" "$val" >&2; return 1; }
+# __neo_cfg_write KEY LINE: replace the KEY= line with LINE (drop it if LINE is
+# empty), atomically: temp file in the same dir + rename. KEY is a plain
+# [a-z_.] name; the dot is escaped before it goes into the regex.
+__neo_cfg_write() {
+    local key=${1//./\\.} new=$2 f=$NEOSH_CONFIG dir tmp line found=0
     dir=${f%/*}
     [[ -d $dir ]] || mkdir -p -m 700 -- "$dir" || return 1
     [[ -e $f ]] || : > "$f" || return 1
@@ -102,13 +178,20 @@ __neo_cfg_save() {
     {
         while IFS= read -r line || [[ -n $line ]]; do
             if [[ $line =~ ^[[:space:]]*${key}[[:space:]]*= ]]; then
-                (( found )) || printf '%s=%s\n' "$key" "$val"; found=1
+                if (( ! found )) && [[ -n $new ]]; then printf '%s\n' "$new"; fi
+                found=1
             else
                 printf '%s\n' "$line"
             fi
         done < "$f"
-        (( found )) || printf '%s=%s\n' "$key" "$val"
+        if (( ! found )) && [[ -n $new ]]; then printf '%s\n' "$new"; fi
     } > "$tmp" && chmod 644 -- "$tmp" && mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; return 1; }
+}
+
+__neo_cfg_save() {
+    local key=$1 val=$2
+    __neo_valid "$key" "$val" || { printf 'neosh: invalid value for %s: %s\n' "$key" "$val" >&2; return 1; }
+    __neo_cfg_write "$key" "$key=$val" || return 1
     __neo_cfg[$key]=$val
 }
 
@@ -169,12 +252,12 @@ __neo_glyphset() {
     if (( __neo_utf8 )); then
         __neo_g=( [tl]='╭─' [bl]='╰─' [arrow]='▶' [fill]='─' [lb]='◢' [rb]='◣' [lp]='⟨' [rp]='⟩'
                   [branch]='⎇' [dirty]='●' [clean]='✓' [fail]='✖' [time]='⏱' [clock]='炉'
-                  [jobs]='⚙' [ssh]='⇄' [box]='⬢' [venv]='⌬' [root]='⚠' [hex]='⬡' [ell]='…' [cont]='┊'
+                  [jobs]='⚙' [ssh]='⇄' [box]='⬢' [venv]='⌬' [root]='⚠' [hex]='⬡' [ell]='…' [cont]='┊' [nest]='↳'
                   [bar]='█' [bar0]='░' [sep]='·' )
     else
         __neo_g=( [tl]='.-' [bl]="'-" [arrow]='>' [fill]='-' [lb]='[' [rb]=']' [lp]='(' [rp]=')'
                   [branch]='git:' [dirty]='*' [clean]='=' [fail]='x' [time]='t' [clock]=''
-                  [jobs]='&' [ssh]='ssh' [box]='box' [venv]='py' [root]='!' [hex]='<>' [ell]='...' [cont]='|'
+                  [jobs]='&' [ssh]='ssh' [box]='box' [venv]='py' [root]='!' [hex]='<>' [ell]='...' [cont]='|' [nest]='lvl'
                   [bar]='#' [bar0]='.' [sep]='-' )
     fi
 }
@@ -220,14 +303,66 @@ __neo_say() {
 }
 
 __neo_greeting() {
-    local h
+    local h hm
     printf -v h '%(%H)T' -1
+    printf -v hm '%(%H:%M)T' -1
     h=$((10#$h))
-    if   (( h < 5 ));  then __neo_say '(￣o￣) zzz' "Still up at $(printf '%(%H:%M)T' -1), commander? I'll keep the hearth warm." '夜更かしですね…'
+    if   (( h < 5 ));  then __neo_say '(￣o￣) zzz' "Still up at $hm, commander? I'll keep the hearth warm." '夜更かしですね…'
+        printf -v __neo_late '%(%s)T' -1   # that counts as this hour's bedtime nag
     elif (( h < 11 )); then __neo_say '(｡•̀ᴗ-)✧' 'Good morning, commander! Shell warmed up and ready.' 'おはようございます！'
     elif (( h < 18 )); then __neo_say '(・ω・)ノ' 'Good afternoon! Everything is humming along nicely.' 'こんにちは！'
     else                    __neo_say '(´｡• ᵕ •｡`)' 'Good evening, commander. Quiet night in the shell so far.' 'こんばんは。'
     fi
+}
+
+# ── KAGARI's remarks between commands ────────────────────────────────────────
+# After a command finishes she may comment on a streak of failures, cheer when
+# it ends, or nag you to sleep between 02:00 and 05:00 (at most once an hour).
+# Ctrl-C (130) and Ctrl-Z (148) are you changing your mind, not a failure, so
+# they neither extend nor end a streak. Turn it off with `neo set quips off`.
+__neo_streak=0
+__neo_late=0
+__neo_quip_gap=
+
+__neo_quip() { # same arguments as __neo_say
+    printf '%s' "$__neo_quip_gap"; __neo_quip_gap=
+    __neo_say "$@"
+    __neo_quipped=1
+}
+
+__neo_quips() { # STATUS
+    __neo_quipped=0
+    [[ ${__neo_cfg[navigator]} == on && ${__neo_cfg[quips]} == on ]] || return 0
+    local st=$1 n
+    if (( st == 130 || st == 148 )); then :
+    elif (( st )); then
+        n=$(( ++__neo_streak ))
+        if (( n == 3 )); then
+            __neo_quip '(・_・;)' 'Three misses in a row, commander. Deep breath, then read that error once more?' '三連続エラー…'
+        elif (( n == 5 )); then
+            __neo_quip '(；´Д｀)' 'Five failures straight! Maybe a peek at --help or the man page?' '五連続…がんばって！'
+        elif (( n % 10 == 0 )); then
+            __neo_quip '(╥﹏╥)' "$n in a row... I still believe in you, commander. Or maybe a short break?" '休憩しませんか？'
+        fi
+    else
+        if (( __neo_streak >= 3 )); then
+            __neo_quip '(ﾉ´ヮ`)ﾉ*: ･ﾟ' "There it is! Back on track after $__neo_streak misses." '復旧しました！'
+        fi
+        __neo_streak=0
+    fi
+    (( __neo_quipped )) && return 0
+    local h now hm
+    printf -v h '%(%H)T' -1; h=$((10#$h))
+    (( h >= 2 && h < 5 )) || return 0
+    printf -v now '%(%s)T' -1
+    (( now - __neo_late >= 3600 )) || return 0
+    __neo_late=$now
+    printf -v hm '%(%H:%M)T' -1
+    case $(( RANDOM % 3 )) in
+        0) __neo_quip '(￣o￣) zzz' "It's $hm, commander. Even the hearth banks its fire at night... bed?" '早く寝てね。' ;;
+        1) __neo_quip '(◞‸◟)' "$hm already. Your future self would like you asleep, commander." 'もう寝る時間ですよ。' ;;
+        *) __neo_quip '(-_-) zzZ' "Commander, it's $hm. The code will still be here in the morning." 'おやすみなさい…' ;;
+    esac
 }
 
 # exit status → label + kaomoji for the prompt
@@ -328,6 +463,19 @@ __neo_precmd() {
 
     [[ ${__neo_cfg[prompt]} == on ]] || return "$st"
 
+    # transient prompt: an empty Enter runs no command, so PS0 never printed the
+    # collapse. Do it here instead; the cursor is still right below the prompt.
+    if (( ${#__neo_tpa[@]} && !__neo_tp_i && __neo_tp_empty )); then printf '%s' "${__neo_tpa[0]}"; fi
+    __neo_tpa=() __neo_tp_i=0 __neo_tp_n=0 __neo_tp_rows=0 __neo_tp_txt= __neo_tp_empty=0
+
+    # KAGARI's remarks; with spacing on she gets the blank line, then the prompt
+    __neo_quipped=0
+    if (( ran )); then
+        [[ ${__neo_cfg[spacing]} == on ]] && (( __neo_prompts )) && __neo_quip_gap=$'\n'
+        __neo_quips "$st"
+        __neo_quip_gap=
+    fi
+
     # ── gather: identity · path · git · context · right side ──
     local idc=${c[a1]}
     (( EUID == 0 )) && idc=${c[crit]}
@@ -364,6 +512,10 @@ __neo_precmd() {
     # toolbox / distrobox / podman / docker
     [[ -f /run/.containerenv || -f /.dockerenv ]] && ctx+=" ${g[box]} ${CONTAINER_ID:-${__neo_box:-container}}"
     [[ -n ${SSH_CONNECTION-} ]] && ctx+=" ${g[ssh]} ssh"
+    # nested shell: `exit` leads back to another shell, not out of the terminal
+    if [[ ${__neo_cfg[shlvl]} == on && ${SHLVL-} =~ ^[0-9]+$ ]] && (( 10#$SHLVL > 1 )); then
+        ctx+=" ${g[nest]} $(( 10#$SHLVL ))"
+    fi
     [[ -n $ctx ]] && { __neo_clean "$ctx"; ctx=$__neo_s; }
     local nj=0 j
     j=$(jobs -p 2>/dev/null) && [[ -n $j ]] && { local -a ja; mapfile -t ja <<< "$j"; nj=${#ja[@]}; }
@@ -438,6 +590,10 @@ __neo_precmd() {
     if (( fill > 0 )); then printf -v line '%*s' "$fill" ''; line=${line// /${g[fill]}}; fi
     __neo_seg "${c[faint]}" "$line"
     __neo_ps+="$rs"$'\001'"$R"$'\002'
+    # rows the HUD line takes (more than 1 only if nothing could make it fit)
+    (( fill < 0 )) && fill=0
+    __neo_tp_hud=$(( (lw + fill + rw + cols - 1) / cols ))
+    (( __neo_tp_hud > 0 )) || __neo_tp_hud=1
 
     # ── line 2 ──
     local ac=${c[a1]}
@@ -452,7 +608,8 @@ __neo_precmd() {
     fi
 
     local gap=
-    [[ ${__neo_cfg[spacing]} == on ]] && (( __neo_prompts++ > 0 )) && gap=$'\n'
+    if [[ ${__neo_cfg[spacing]} == on ]] && (( __neo_prompts > 0 && ! __neo_quipped )); then gap=$'\n'; fi
+    (( ++__neo_prompts ))
     __neo_ps1="$title$gap$__neo_ps"$'\n'"$l2"
     return "$st"
 }
@@ -469,14 +626,88 @@ __neo_install_prompt() {
     __neo_ps2=$'\001'"${__neo_c[faint]}"$'\002'"  ${__neo_g[cont]} "$'\001'"${__neo_c[r]}"$'\002'
     # PS0 is expanded right before each command runs. Assigning inside an array
     # subscript stamps the start time without starting a subshell.
-    __neo_stamp='${__neo_null[__neo_t0=${EPOCHREALTIME/[.,]/}]}'
-    [[ -n ${EPOCHREALTIME-} ]] || __neo_stamp='${__neo_null[__neo_t0=1]}'   # bash 4.4: no timing
+    # ${__neo_tpa[...]} is the transient-prompt redraw (empty unless
+    # transient=on). The index steps on every expansion, so when one Enter
+    # runs several commands (a multi-line paste) only the first prints it.
+    __neo_stamp='${__neo_tpa[__neo_tp_i++]}${__neo_null[__neo_t0=${EPOCHREALTIME/[.,]/}]}'
+    [[ -n ${EPOCHREALTIME-} ]] || __neo_stamp='${__neo_tpa[__neo_tp_i++]}${__neo_null[__neo_t0=1]}'   # bash 4.4: no timing
+    # drop the stamp an older neosh left behind (`neo reload` after an update)
+    PS0=${PS0//'${__neo_null[__neo_t0=${EPOCHREALTIME/[.,]/}]}'/}
     if [[ ${PS0-} != *"$__neo_stamp"* ]]; then PS0="$__neo_stamp${PS0-}"; fi
     # Run first in PROMPT_COMMAND so it sees the real $? / PIPESTATUS. Other
     # hooks (vte.sh, direnv, …) keep running after it, unchanged.
     if [[ ${PROMPT_COMMAND-} != __neo_precmd* ]]; then
         PROMPT_COMMAND="__neo_precmd${PROMPT_COMMAND:+$'\n'$PROMPT_COMMAND}"
     fi
+}
+
+# ── transient prompt ─────────────────────────────────────────────────────────
+# Optional (transient=on): when you press Enter, the two-line HUD you typed in
+# is redrawn as one short "▶ command" line, so scrollback keeps only commands
+# and output. Enter becomes a readline macro: first a bind -x hook that sees
+# the typed line (READLINE_LINE) and works out how many rows the prompt and
+# input took, then plain accept-line. PS0, printed just before the command
+# runs, moves the cursor back up over those rows, clears them and prints the
+# short form. The hook only measures; it never changes the line or runs it.
+__neo_tp_keys='\C-x\C-n\C-t' __neo_tp_acc='\C-x\C-n\C-a'
+__neo_tpa=() __neo_tp_i=0 __neo_tp_n=0 __neo_tp_rows=0 __neo_tp_txt= __neo_tp_empty=0 __neo_tp_hud=1
+: "${__neo_tp_bound:=0}"   # survives `neo reload`
+
+__neo_tp_mark() {
+    local st=$? cols=${COLUMNS:-80} pre seg w rows=0 i out
+    (( cols > 0 )) || cols=80
+    local -a segs lines
+    # a multi-line paste arrives as one line with newlines in it
+    mapfile -t segs <<< "$READLINE_LINE"
+    if (( __neo_tp_n )); then pre=$__neo_tp_w2; else pre=$__neo_tp_w1; fi
+    for seg in "${segs[@]}"; do
+        __neo_width "${seg//[[:cntrl:]]/^?}"   # readline shows control chars as ^X
+        w=$(( pre + __neo_w ))
+        (( rows += w > 0 ? (w + cols - 1) / cols : 1 ))
+        pre=0
+    done
+    (( __neo_tp_empty = !__neo_tp_n && ${#READLINE_LINE} == 0 ))
+    if (( __neo_tp_n++ )); then __neo_tp_txt+=$'\n'; fi   # continuation (PS2) line
+    __neo_tp_txt+=$READLINE_LINE
+    (( __neo_tp_rows += rows ))
+
+    mapfile -t lines <<< "$__neo_tp_txt"
+    out=$'\e['"$(( __neo_tp_rows + __neo_tp_hud ))"$'A\r\e[J'
+    for i in "${!lines[@]}"; do
+        __neo_clean "${lines[i]}"
+        if (( i == 0 )); then out+="${__neo_c[a1]}${__neo_g[arrow]}${__neo_c[r]} $__neo_s"
+        else out+=$'\n'"${__neo_c[faint]}  ${__neo_g[cont]}${__neo_c[r]} $__neo_s"; fi
+    done
+    __neo_tpa=("$out"$'\n' '') __neo_tp_i=0
+    return "$st"
+}
+
+# Bind or unbind Enter to match transient=on/off.
+__neo_tp_apply() {
+    [[ -t 0 ]] && [[ -o emacs || -o vi ]] || return 0   # no line editing here
+    local want=0 km q
+    [[ ${__neo_cfg[transient]} == on && ${__neo_cfg[prompt]} == on && ${PS1-} == '${__neo_ps1}' ]] && want=1
+    if (( want && ! __neo_tp_bound )); then
+        q=$(bind -q accept-line 2>/dev/null)
+        if [[ $q != *'"\C-m"'* ]]; then
+            printf 'neosh: Enter is bound to something other than accept-line; transient prompt left off\n' >&2
+            return 0
+        fi
+        for km in emacs vi-insert vi-command; do
+            bind -m "$km" -x "\"$__neo_tp_keys\": __neo_tp_mark"
+            bind -m "$km" "\"$__neo_tp_acc\": accept-line"
+            bind -m "$km" "\"\\C-m\": \"$__neo_tp_keys$__neo_tp_acc\""
+        done
+        __neo_tp_bound=1
+    elif (( ! want && __neo_tp_bound )); then
+        for km in emacs vi-insert vi-command; do
+            bind -m "$km" '"\C-m": accept-line'
+            bind -m "$km" -r "$__neo_tp_keys"
+            bind -m "$km" -r "$__neo_tp_acc"
+        done
+        __neo_tp_bound=0 __neo_tpa=()
+    fi
+    return 0
 }
 
 # ── boot sequence ────────────────────────────────────────────────────────────
@@ -496,7 +727,7 @@ __neo_boot() {
     local c=${__neo_c[a1]} m=${__neo_c[a2]} R=${__neo_c[r]} B=${__neo_c[b]} jp=
     (( __neo_utf8 )) && jp=" // 新殻インターフェース"
     local th=${__neo_cfg[theme]^^}
-    (( __neo_utf8 )) && th+=" ${__neo_theme_jp[${__neo_cfg[theme]}]}"
+    (( __neo_utf8 )) && [[ -n ${__neo_theme_jp[${__neo_cfg[theme]}]-} ]] && th+=" ${__neo_theme_jp[${__neo_cfg[theme]}]}"
     if [[ $mode == compact ]]; then
         printf ' %s%s%s %sNEOSH %s%s%s%s  %s%s bash %s %s theme %s%s\n' \
             "$m" "${__neo_g[hex]}" "$R" "$B$c" "$NEOSH_VERSION" "$R" "${__neo_c[dim]}" "$jp" \
@@ -648,14 +879,86 @@ __neo_status() {
 }
 
 __neo_themes() {
-    local t a b c rgb
+    local t a b c rgb mark jp
     for t in "${__neo_theme_order[@]}"; do
         read -ra rgb <<< "${__neo_theme_rgb[$t]}"
         __neo_sgr "${rgb[0]}"; a=$__neo_esc; __neo_sgr "${rgb[1]}"; b=$__neo_esc; __neo_sgr "${rgb[2]}"; c=$__neo_esc
-        local mark=' '; [[ $t == "${__neo_cfg[theme]}" ]] && mark=${__neo_g[arrow]}
-        local jp=; (( __neo_utf8 )) && jp=${__neo_theme_jp[$t]}
-        printf ' %s %s██%s██%s██%s  %-8s %s%s%s\n' "$mark" "$a" "$b" "$c" "${__neo_c[r]}" "${t^^}" "${__neo_c[dim]}" "$jp" "${__neo_c[r]}"
+        mark=' '; [[ $t == "${__neo_cfg[theme]}" ]] && mark=${__neo_g[arrow]}
+        jp=custom; [[ -n ${__neo_theme_jp[$t]-} ]] && { jp=; (( __neo_utf8 )) && jp=${__neo_theme_jp[$t]}; }
+        printf ' %s %s██%s██%s██%s  %-16s %s%s%s\n' "$mark" "$a" "$b" "$c" "${__neo_c[r]}" "${t^^}" "${__neo_c[dim]}" "$jp" "${__neo_c[r]}"
     done
+    printf '\n   %sneo preview%s to see your prompt in each, %sneo theme add%s for your own%s\n' \
+        "${__neo_c[a1]}" "${__neo_c[dim]}" "${__neo_c[a1]}" "${__neo_c[dim]}" "${__neo_c[r]}"
+}
+
+# neo preview [NAME...]: your real prompt (this directory, this repo) drawn in
+# each theme, as if the last command failed after 4.2s so the status colours
+# show too. Runs in a subshell, so nothing about this session changes.
+__neo_preview() {
+    local t
+    local -a names=("$@")
+    (( ${#names[@]} )) || names=("${__neo_theme_order[@]}")
+    for t in "${names[@]}"; do
+        [[ -n ${__neo_theme_rgb[${t,,}]+x} ]] && continue
+        __neo_clean "$t"; printf 'neosh: unknown theme: %s (themes: %s)\n' "$__neo_s" "${__neo_theme_order[*]}" >&2
+        return 1
+    done
+    (
+        __neo_cfg[title]=off __neo_cfg[spacing]=off __neo_cfg[quips]=off
+        __neo_tpa=() __neo_tp_empty=0
+        local active=${__neo_cfg[theme]} mark jp ps
+        for t in "${names[@]}"; do
+            t=${t,,}
+            __neo_cfg[theme]=$t; __neo_palette
+            mark=' '; [[ $t == "$active" ]] && mark=${__neo_g[arrow]}
+            jp=; [[ -n ${__neo_theme_jp[$t]-} ]] && (( __neo_utf8 )) && jp=" ${__neo_theme_jp[$t]}"
+            [[ -z ${__neo_theme_jp[$t]-} ]] && jp=' custom'
+            printf '\n %s%s %s%s%s%s%s\n' "${__neo_c[a2]}" "$mark" "${__neo_c[b]}${__neo_c[a1]}" "${t^^}" "${__neo_c[r]}${__neo_c[dim]}" "$jp" "${__neo_c[r]}"
+            if [[ -n ${EPOCHREALTIME-} ]]; then __neo_t0=$(( ${EPOCHREALTIME/[.,]/} - 4200000 )); else __neo_t0=1; fi
+            false; __neo_precmd
+            ps=${__neo_ps1//[$'\001\002']/}
+            printf '%s%sneo theme %s%s\n' "$ps" "${__neo_c[dim]}" "$t" "${__neo_c[r]}"
+        done
+        printf '\n'
+    )
+}
+
+# neo theme add NAME A1 A2 A3 [DIM FAINT]: save a custom theme to the config
+__neo_theme_add() {
+    local name=${1,,} t h r g b line
+    if (( $# != 4 && $# != 6 )); then
+        printf 'usage: neo theme add NAME A1 A2 A3 [DIM FAINT]   (hex colours, e.g. #3ef3ff)\n' >&2; return 2
+    fi
+    if ! __neo_theme_name_ok "$name"; then
+        __neo_clean "$name"
+        printf 'neosh: theme names are a-z, 0-9 and _ (up to 16, starting with a letter) and not a built-in: %s\n' "$__neo_s" >&2
+        return 1
+    fi
+    shift
+    __neo_theme_parse "$*" || { printf 'neosh: colours must be #rrggbb hex values\n' >&2; return 1; }
+    if [[ -z ${__neo_theme_rgb[$name]+x} ]] && (( ${#__neo_theme_order[@]} >= ${#__neo_theme_builtin[@]} + __neo_theme_max )); then
+        printf 'neosh: there are already %d custom themes; remove one first\n' "$__neo_theme_max" >&2; return 1
+    fi
+    line="theme.$name ="
+    for t in $__neo_s; do
+        IFS=, read -r r g b <<< "$t"
+        printf -v h ' #%02x%02x%02x' "$r" "$g" "$b"; line+=$h
+    done
+    __neo_cfg_write "theme.$name" "$line" || return 1
+    __neo_cfg_load; __neo_refresh
+    __neo_preview "$name"
+    __neo_say '(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧' "Theme ${name^^} saved! Switch to it with: neo theme $name" '新しいテーマ！'
+}
+
+__neo_theme_rm() {
+    local name=${1-}; name=${name,,}
+    [[ $# -eq 1 ]] || { printf 'usage: neo theme rm NAME\n' >&2; return 2; }
+    if [[ -n ${__neo_theme_jp[$name]+x} ]]; then printf 'neosh: %s is built in and stays\n' "$name" >&2; return 1; fi
+    if [[ -z ${__neo_theme_rgb[$name]+x} ]]; then __neo_clean "$name"; printf 'neosh: no custom theme %s\n' "$__neo_s" >&2; return 1; fi
+    if [[ ${__neo_cfg[theme]} == "$name" ]]; then __neo_cfg_save theme hearth || return 1; fi
+    __neo_cfg_write "theme.$name" '' || return 1
+    __neo_cfg_load; __neo_refresh
+    __neo_say '(・ω・)ノ' "Theme ${name^^} removed. Now on ${__neo_cfg[theme]^^}."
 }
 
 __neo_help() {
@@ -668,12 +971,16 @@ __neo_help() {
     done <<'EOF'
 neo status;system HUD: core, thermal, storage, network, shell
 neo theme [NAME];list themes or switch (saved)
+neo theme add NAME HEX...;custom theme from 3 or 5 colours
+neo theme rm NAME;delete a custom theme
+neo preview [NAME...];your prompt drawn in each theme
 neo boot full|compact|off;startup banner style
 neo set KEY VALUE;change a setting (see `neo config`)
 neo config;show settings and the config file
 neo reload;reload neosh in this shell
 neo nav;ask KAGARI how things are
 neo off;plain bash prompt for this session
+neo update [--pull];reinstall from your checkout (--pull: git pull first)
 neo version;version info
 neo uninstall;remove neosh, back to plain bash
 EOF
@@ -683,6 +990,32 @@ EOF
 __neo_refresh() {
     __neo_detect; __neo_palette; __neo_glyphset
     __neo_ps2=$'\001'"${__neo_c[faint]}"$'\002'"  ${__neo_g[cont]} "$'\001'"${__neo_c[r]}"$'\002'
+    # visible widths of the input line's prefix (line 2 of the HUD, and PS2)
+    __neo_width "${__neo_g[bl]}${__neo_g[arrow]} "; __neo_tp_w1=$__neo_w
+    __neo_width "  ${__neo_g[cont]} "; __neo_tp_w2=$__neo_w
+    [[ ${PS1-} == '${__neo_ps1}' ]] && __neo_tp_apply
+    return 0
+}
+
+# neo update: run update.sh from the checkout neosh was installed from (the
+# installer records it in the manifest), then reload this shell onto it.
+__neo_update() {
+    local m=$NEOSH_HOME/install.manifest line src=
+    if [[ -f $m && -O $m ]]; then
+        while IFS= read -r line || [[ -n $line ]]; do
+            [[ $line == source=* ]] && { src=${line#source=}; break; }
+        done < "$m"
+    fi
+    if [[ -z $src || ! -f $src/update.sh || ! -O $src/update.sh ]]; then
+        printf 'neosh: no checkout recorded for this install (or it moved).\n' >&2
+        printf '       Run ./update.sh from your neosh checkout instead.\n' >&2
+        return 1
+    fi
+    "$BASH" "$src/update.sh" "$@" || return
+    [[ -r $NEOSH_HOME/neosh.bash ]] || return 0
+    unset __NEOSH_LOADED
+    # shellcheck source=/dev/null
+    . "$NEOSH_HOME/neosh.bash"
 }
 
 neo() {
@@ -691,11 +1024,16 @@ neo() {
         help|-h|--help) __neo_help ;;
         status|hud) __neo_status ;;
         theme|themes)
-            if [[ -z ${1-} ]]; then __neo_themes; return; fi
+            case ${1-} in
+                '') __neo_themes; return ;;
+                add|new) shift; __neo_theme_add "$@"; return ;;
+                rm|remove|del) shift; __neo_theme_rm "$@"; return ;;
+            esac
             local t=${1,,}
             __neo_cfg_save theme "$t" || { printf 'neosh: themes: %s\n' "${__neo_theme_order[*]}" >&2; return 1; }
             __neo_refresh
-            __neo_say '(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧' "Theme switched to ${t^^}!" "${__neo_theme_jp[$t]}" ;;
+            __neo_say '(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧' "Theme switched to ${t^^}!" "${__neo_theme_jp[$t]-}" ;;
+        preview) __neo_preview "$@" ;;
         boot)
             [[ -n ${1-} ]] || { printf 'boot=%s\n' "${__neo_cfg[boot]}"; return; }
             __neo_cfg_save boot "$1" && printf 'boot=%s\n' "$1" ;;
@@ -707,8 +1045,11 @@ neo() {
             if [[ $1 == prompt ]]; then printf 'neosh: open a new shell (or `neo reload`) to apply prompt=%s\n' "$2"; fi ;;
         config|conf)
             printf '%s# %s%s\n' "${__neo_c[dim]}" "$NEOSH_CONFIG" "${__neo_c[r]}"
-            local k; for k in theme boot color glyphs prompt navigator clock git git_dirty title spacing duration path_depth; do
+            local k; for k in theme boot color glyphs prompt navigator quips clock git git_dirty shlvl title spacing transient duration path_depth; do
                 printf '%-11s = %s\n' "$k" "${__neo_cfg[$k]}"
+            done
+            for k in "${__neo_theme_order[@]:${#__neo_theme_builtin[@]}}"; do
+                printf '%s# theme.%s = %s%s\n' "${__neo_c[dim]}" "$k" "${__neo_theme_rgb[$k]}" "${__neo_c[r]}"
             done ;;
         reload)
             unset __NEOSH_LOADED
@@ -720,9 +1061,11 @@ neo() {
             PROMPT_COMMAND=${PROMPT_COMMAND#__neo_precmd}; PROMPT_COMMAND=${PROMPT_COMMAND#$'\n'}
             PS0=${PS0//"$__neo_stamp"/}
             PS1=${__neo_orig_ps1-'\s-\v\$ '} PS2=${__neo_orig_ps2-'> '}
+            __neo_tp_apply
             __neo_say '(・へ・)' 'Prompt handed back to plain bash for this session. `neo reload` to bring me back.' ;;
         version|-v|--version)
             printf 'neosh %s on bash %s (%s)\n' "$NEOSH_VERSION" "$BASH_VERSION" "$NEOSH_HOME" ;;
+        update|upgrade) __neo_update "$@" ;;
         uninstall)
             if [[ -x $NEOSH_HOME/uninstall.sh ]]; then "$NEOSH_HOME/uninstall.sh" "$@"
             else printf 'neosh: uninstaller not found in %s\n' "$NEOSH_HOME" >&2; return 1; fi ;;
@@ -733,10 +1076,14 @@ neo() {
 __neo_complete() {
     local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
     if (( COMP_CWORD == 1 )); then
-        mapfile -t COMPREPLY < <(compgen -W 'help status theme boot set config reload nav off version uninstall' -- "$cur")
+        mapfile -t COMPREPLY < <(compgen -W 'help status theme preview boot set config reload nav off update version uninstall' -- "$cur")
+    elif [[ ${COMP_WORDS[1]} == preview ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "${__neo_theme_order[*]}" -- "$cur")
+    elif (( COMP_CWORD == 3 )) && [[ ${COMP_WORDS[1]} == theme && $prev == @(rm|remove|del) ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "${__neo_theme_order[*]:${#__neo_theme_builtin[@]}}" -- "$cur")
     elif (( COMP_CWORD == 2 )); then
         case $prev in
-            theme) mapfile -t COMPREPLY < <(compgen -W "${__neo_theme_order[*]}" -- "$cur") ;;
+            theme) mapfile -t COMPREPLY < <(compgen -W "${__neo_theme_order[*]} add rm" -- "$cur") ;;
             boot)  mapfile -t COMPREPLY < <(compgen -W 'full compact off' -- "$cur") ;;
             set)   mapfile -t COMPREPLY < <(compgen -W "${!__neo_cfg[*]}" -- "$cur") ;;
         esac
@@ -748,6 +1095,7 @@ __neo_complete() {
             color) opts='auto truecolor 256 off' ;;
             glyphs) opts='auto unicode ascii' ;;
             duration|path_depth) opts= ;;
+            prompt|navigator|quips|clock|git|git_dirty|shlvl|title|spacing|transient) opts='on off' ;;
             *) opts='on off' ;;
         esac
         mapfile -t COMPREPLY < <(compgen -W "$opts" -- "$cur")
@@ -789,4 +1137,5 @@ if ! declare -F command_not_found_handle >/dev/null; then
     }
 fi
 __neo_install_prompt
+__neo_tp_apply
 __neo_boot

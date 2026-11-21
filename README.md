@@ -75,6 +75,8 @@ Install with `--no-hook` if you want plain bash by default and neosh only when y
 | `neo set KEY VALUE` | Change any setting below (saved, applied live) |
 | `neo config` | Show the current settings and the config file path |
 | `neo nav` | Ask KAGARI how things are |
+| `neo link URL` / `neo link off` | Link a HEARTH hub (see *HEARTH hub*) / unlink it |
+| `neo sync` | Fetch the hub's theme pack now |
 | `neo off` | Hand the prompt back to plain bash for this session (`neo reload` brings it back) |
 | `neo reload` | Reload neosh in the current shell |
 | `neo update [--pull]` | Run `update.sh` from the checkout you installed from, then reload this shell. `--pull` gets the newest version from GitHub first |
@@ -88,6 +90,12 @@ Install with `--no-hook` if you want plain bash by default and neosh only when y
 - On the Linux console (`TERM=linux`) or a non-UTF-8 locale, neosh switches to plain ASCII glyphs (`.-[ user@host ]-( ~/src )`).
 - KAGARI greets you depending on the time of day, reacts to failed commands in the prompt, reads `neo status` out, and answers `command not found` when your distro doesn't have its own handler. Fedora's PackageKit handler is left in place. Turn her off with `neo set navigator off`.
 - Between commands KAGARI keeps an eye on you. After three, five or ten failures in a row she says something, and she cheers when the streak ends. Ctrl-C and Ctrl-Z don't count as failures. Between 02:00 and 05:00 she suggests going to bed, at most once an hour. `neo set quips off` silences only these remarks.
+
+### HEARTH hub
+
+`neo link http://192.168.1.10:8088` links a [HEARTH](../hearth) hub. neosh then follows the fleet theme, gets the hub's palettes (custom ones too, marked `hub` in `neo theme`) and uses KAGARI's shared greetings and idle lines. `neo theme NAME` makes that theme the fleet theme, so HEARTH, RyuCore and KuroDeck change with it. Set `hub_sync off` to keep the hub's palettes and lines but pick your own theme.
+
+The pack is fetched in the background when a shell starts (it doesn't slow the prompt down) and with `neo sync`, and stored in `~/.config/neosh/hub.pack`. A change on the hub reaches an open shell at its next start or `neo sync`. `NEOSH_THEME=` still wins for one session.
 
 ### Custom themes
 
@@ -140,6 +148,8 @@ Enter is bound to a readline macro: a `bind -x` hook that only measures how many
 | `transient` | `off` | `on` `off` | Collapse old prompts to `▶ command` (see *Transient prompt*) |
 | `duration` | `3` | `0`–`9999` | Show runtime of commands slower than N seconds (`0` = never) |
 | `path_depth` | `4` | `1`–`99` | Folders shown before the path is shortened with `…` |
+| `hub` | `off` | `off` or `http(s)://host[:port]` | HEARTH hub to follow (`neo link`) |
+| `hub_sync` | `on` | `on` `off` | Follow the hub's fleet theme and push yours to it |
 
 ## Updating
 
@@ -183,6 +193,7 @@ neosh is not a re-implementation of bash. A new shell written from scratch would
 - **Hostile repositories.** The branch is read straight from `.git/HEAD` without starting git. The `●`/`✓` check runs `git status` with `core.fsmonitor` disabled and optional locks off, so a repo's config can't use the fsmonitor hook to run a program, and the index is never written. This is the same exposure as running `git status` yourself. Set `git_dirty=off` if you browse untrusted checkouts.
 - **The config file is parsed, never sourced.** Only the keys above are read, each value is validated, and the file is ignored if you don't own it. At worst a tampered config can change a colour.
 - **The installer is careful.** It refuses to run as root by default. It won't overwrite a `neosh` it didn't create. It follows a symlinked `~/.bashrc` (stow, chezmoi, yadm) and edits the target, so your link survives. Every file is written to a temp file and renamed into place, and the new `~/.bashrc` must pass `bash -n` before it replaces the old one. Both scripts are read in full before they start, so they can't be changed partway through a run.
+- **The hub link is opt-in and parsed, never run.** Until you `neo link` a hub, neosh makes no network requests. When linked it only runs `curl` (http/https, 4 s timeout, size-capped) against that URL. The pack is checked line by line like the config: colours must be `#rrggbb`, names `a-z0-9_`, control characters are stripped from KAGARI's lines, and a file you don't own is ignored. A hostile hub can change colours and what KAGARI says, nothing more.
 - **Updates are explicit.** Only `update.sh --pull` / `neo update --pull` touch the network, by running `git pull --ff-only` in your own checkout, and only when you run them. Nothing checks for updates in the background. The pulled code goes through the same installer and self-test as a fresh install.
 - **History.** neosh doesn't change `HISTCONTROL`, `HISTSIZE` or `HISTFILE`. It only turns on `histappend` (and `checkwinsize`), so parallel terminals don't overwrite each other's history.
 

@@ -105,6 +105,32 @@ check "neo preview strips readline markers" bash -c '[[ $1 != *[$'"'"'\001\002'"
 out=$(sb "$H" bash -i -c 'neo preview nope' 2>&1 </dev/null)
 check "neo preview rejects unknown themes" grep -q 'unknown theme' <<< "$out"
 
+echo "── HEARTH hub pack"
+HP=$(newhome); sb "$HP" "$ROOT/install.sh" >/dev/null 2>&1
+P="$HP/.config/neosh/hub.pack"
+printf '%s\n' 'rev=abc' 'theme=neon' 'palette.neon=#ff00aa #00ffcc #ffee00 #ae69ae #603a60' 'jp.neon=電光' \
+    'palette.hearth=#00ffff #ff3ea5 #9b7bff #7d93b5 #45567a' \
+    'palette.Bad-Id=#ff00aa #00ffcc #ffee00' 'palette.evil=$(touch HACKED) #00ffcc #ffee00' 'palette.rm=#ff00aa #00ffcc #ffee00' \
+    'greet.24=(・ω・)|Hello $(touch HACKED2) at {time} in the {where}|やあ' "idle=(x)|esc $(printf '\e[31m')red|jp" 'idle=too|many|bars|here' > "$P"
+chmod 600 "$P"
+out=$(sb "$HP" bash -i -c 'echo "T=${__neo_cfg[theme]}"' 2>/dev/null </dev/null)
+check "pack ignored while no hub is linked" grep -q 'T=hearth' <<< "$out"
+printf 'hub=http://127.0.0.1:9\n' >> "$HP/.config/neosh/neosh.conf"
+out=$(cd "$HP" && sb "$HP" bash -i -c 'echo "T=${__neo_cfg[theme]}"; echo "N=${#__neo_theme_hub[@]} G=${#__neo_greet[@]} I=${#__neo_idle[@]}"; echo "H=${__neo_theme_rgb[hearth]%% *}"; neo nav; neo theme' 2>/dev/null </dev/null)
+check "linked: the hub's fleet theme applies" grep -q 'T=neon' <<< "$out"
+check "only the valid palette is added" grep -q 'N=1 ' <<< "$out"
+check "hub colours override a built-in" grep -q 'H=0,255,255' <<< "$out"
+check "malformed greeting/idle lines dropped" grep -q 'G=1 I=1' <<< "$out"
+check "pack text is never executed" bash -c '! compgen -G "$1/HACKED*" >/dev/null' _ "$HP"
+check "escape sequences stripped from pack text" bash -c '! grep -q $'"'"'\e\[31m'"'"' <<< "$1"' _ "$out"
+check "greeting fills {where}" grep -q 'in the shell' <<< "$out"
+out=$(sb "$HP" bash -i -c 'neo theme rm neon; neo set hub "http://x; rm -rf /"; echo rc=$?' 2>&1 </dev/null)
+check "hub themes can't be removed locally" grep -q 'comes from the hub' <<< "$out"
+check "a bad hub URL is refused" grep -q 'rc=1' <<< "$out"
+out=$(sb "$HP" bash -i -c 'neo link off >/dev/null; echo "T=${__neo_cfg[theme]} N=${#__neo_theme_hub[@]} H=${__neo_theme_rgb[hearth]%% *}"' 2>/dev/null </dev/null)
+check "unlinking restores local themes and colours" grep -q 'T=hearth N=0 H=62,243,255' <<< "$out"
+check "unlinking removes the pack" test ! -e "$P"
+
 echo "── nested shells (SHLVL)"
 out=$(sb "$H" SHLVL=3 bash -i -c '__neo_precmd; printf "%s" "$__neo_ps1"' 2>/dev/null </dev/null)
 check "nested shell shows its depth" grep -q '↳ 4' <<< "$out"

@@ -50,6 +50,11 @@ declare -gA __neo_theme_rgb=(
     [aurum]="255,201,74    255,241,184  217,139,43   181,162,122  110,95,62"
     [specter]="230,238,247 159,180,201  110,130,150  140,150,162  76,85,96"
 )
+declare -gA __neo_theme_rgb0=()   # built-in colours, restored before a hub pack overrides them
+for __neo_l in "${!__neo_theme_rgb[@]}"; do __neo_theme_rgb0[$__neo_l]=${__neo_theme_rgb[$__neo_l]}; done
+unset __neo_l
+declare -gA __neo_theme_hub=() __neo_theme_hubjp=()   # palettes that came from a HEARTH hub
+__neo_greet=() __neo_idle=() __neo_pack_theme=
 # status colours never change with the theme (same rule as HEARTH)
 __neo_status_rgb="93,255,158 255,182,62 255,59,92"
 
@@ -58,6 +63,7 @@ declare -gA __neo_cfg=(
     [theme]=hearth [boot]=compact [color]=auto [glyphs]=auto [prompt]=on
     [navigator]=on [clock]=on [git]=on [git_dirty]=on [title]=on [spacing]=on
     [duration]=3 [path_depth]=4 [shlvl]=on [quips]=on [transient]=off
+    [hub]=off [hub_sync]=on
 )
 
 # __neo_valid KEY VALUE → 0 if acceptable
@@ -67,7 +73,8 @@ __neo_valid() {
         boot)       [[ $2 == @(full|compact|off) ]] ;;
         color)      [[ $2 == @(auto|truecolor|256|off) ]] ;;
         glyphs)     [[ $2 == @(auto|unicode|ascii) ]] ;;
-        prompt|navigator|clock|git|git_dirty|title|spacing|shlvl|quips|transient) [[ $2 == @(on|off) ]] ;;
+        prompt|navigator|clock|git|git_dirty|title|spacing|shlvl|quips|transient|hub_sync) [[ $2 == @(on|off) ]] ;;
+        hub)        [[ $2 == off || $2 =~ ^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$ ]] ;;
         duration)   [[ $2 =~ ^[0-9]{1,4}$ ]] ;;
         path_depth) [[ $2 =~ ^[0-9]{1,2}$ ]] && (( 10#$2 >= 1 )) ;;
         *) return 1 ;;
@@ -111,13 +118,148 @@ __neo_theme_name_ok() { # NAME → 0 if usable for a custom theme
     [[ $1 =~ ^[a-z][a-z0-9_]{0,15}$ && $__neo_theme_reserved != *" $1 "* && -z ${__neo_theme_jp[$1]+x} ]]
 }
 
-# Forget custom themes (built-ins are the ones with a Japanese name).
+# Forget custom and hub themes (built-ins are the ones with a Japanese name)
+# and put the built-in colours back.
 __neo_theme_reset() {
     local t
     for t in "${!__neo_theme_rgb[@]}"; do
-        [[ -n ${__neo_theme_jp[$t]+x} ]] || unset "__neo_theme_rgb[$t]"
+        if [[ -n ${__neo_theme_jp[$t]+x} ]]; then __neo_theme_rgb[$t]=${__neo_theme_rgb0[$t]}
+        else unset "__neo_theme_rgb[$t]"; fi
     done
     __neo_theme_order=("${__neo_theme_builtin[@]}")
+    __neo_theme_hub=() __neo_theme_hubjp=()
+}
+
+# ── HEARTH hub link ──────────────────────────────────────────────────────────
+# With `hub` set (neo link URL), neosh follows the fleet: the hub's palettes,
+# its fleet-wide theme and KAGARI's shared lines. They're fetched with curl
+# into hub.pack (only when you link, run `neo sync`, or open a shell), and
+# that file is parsed like the config, never sourced: ids, hex colours and
+# plain text only, control characters stripped.
+__neo_pack=${NEOSH_CONFIG%/*}/hub.pack
+__neo_hub_wait=
+
+# "kao|en|jp" → 0 if usable; sets __neo_s to it, cleaned and clipped
+__neo_pack_line() {
+    local kao en jp extra
+    IFS='|' read -r kao en jp extra <<< "$1"
+    [[ -n $kao && -n $en && -n $jp && -z $extra ]] || return 1
+    __neo_s="${kao:0:40}|${en:0:300}|${jp:0:80}"
+}
+
+__neo_pack_load() {
+    __neo_greet=() __neo_idle=() __neo_pack_theme=
+    [[ ${__neo_cfg[hub]} == http* && ${__neo_cfg[hub_sync]} == on ]] || return 0
+    local f=$__neo_pack line k v id n=0
+    [[ -f $f && -r $f && -O $f ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        (( ++n > 400 )) && break
+        [[ $line == ?*=* ]] || continue
+        k=${line%%=*} v=${line#*=}
+        v=${v//[[:cntrl:]]/}
+        case $k in
+            theme) [[ $v =~ ^[a-z][a-z0-9_]{0,15}$ ]] && __neo_pack_theme=$v ;;
+            palette.*)
+                id=${k#palette.}
+                [[ $id =~ ^[a-z][a-z0-9_]{0,15}$ && $__neo_theme_reserved != *" $id "* ]] || continue
+                __neo_theme_parse "$v" || continue
+                if [[ -n ${__neo_theme_jp[$id]+x} || -n ${__neo_theme_hub[$id]+x} ]]; then
+                    __neo_theme_rgb[$id]=$__neo_s
+                elif [[ -z ${__neo_theme_rgb[$id]+x} ]] && (( ${#__neo_theme_order[@]} < ${#__neo_theme_builtin[@]} + 2 * __neo_theme_max )); then
+                    # a custom theme of the same name in your config wins over the hub's
+                    __neo_theme_rgb[$id]=$__neo_s __neo_theme_hub[$id]=1
+                    __neo_theme_order+=("$id")
+                fi ;;
+            jp.*) id=${k#jp.}; [[ $id =~ ^[a-z][a-z0-9_]{0,15}$ ]] && __neo_theme_hubjp[$id]=${v:0:16} ;;
+            greet.*)
+                id=${k#greet.}
+                [[ $id =~ ^[0-9]{1,2}$ ]] && __neo_pack_line "$v" && (( ${#__neo_greet[@]} < 12 )) && __neo_greet+=("$((10#$id))|$__neo_s") ;;
+            idle) __neo_pack_line "$v" && (( ${#__neo_idle[@]} < 40 )) && __neo_idle+=("$__neo_s") ;;
+        esac
+    done < "$f"
+    [[ -n $__neo_pack_theme && -z ${__neo_theme_rgb[$__neo_pack_theme]+x} ]] && __neo_pack_theme=
+    return 0
+}
+
+# Download the pack. $1 = destination (default hub.pack). Never touches the
+# destination unless the hub answered with something that looks like a pack.
+__neo_hub_fetch() {
+    local hub=${__neo_cfg[hub]} dest=${1:-$__neo_pack} tmp dir
+    [[ $hub == http* ]] || return 1
+    type -P curl >/dev/null || { printf 'neosh: curl is needed to talk to the hub\n' >&2; return 1; }
+    dir=${__neo_pack%/*}
+    [[ -d $dir ]] || mkdir -p -m 700 -- "$dir" || return 1
+    tmp=$(mktemp -- "$__neo_pack.XXXXXX") || return 1
+    if curl -fsS --proto '=http,https' -m 4 --max-filesize 262144 -o "$tmp" -- "$hub/api/theme?fmt=text" \
+        && IFS= read -r line < "$tmp" && [[ $line == rev=* ]]; then
+        chmod 600 -- "$tmp" && mv -f -- "$tmp" "$dest" && return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+# At shell start: refresh the pack in the background (no job messages); the
+# prompt picks it up when it lands.
+__neo_hub_bg() {
+    [[ ${__neo_cfg[hub]} == http* && ${__neo_cfg[hub_sync]} == on ]] || return 0
+    type -P curl >/dev/null || return 0
+    printf -v __neo_hub_wait '%(%s)T' -1
+    ( __neo_hub_fetch "$__neo_pack.new" >/dev/null 2>&1 & ) 2>/dev/null
+}
+
+__neo_hub_poll() { # from the prompt, only while a background fetch may still land
+    local now old=${__neo_cfg[theme]}
+    if [[ -f $__neo_pack.new && -O $__neo_pack.new ]]; then
+        __neo_hub_wait=
+        mv -f -- "$__neo_pack.new" "$__neo_pack" 2>/dev/null || return 0
+        __neo_cfg_load; __neo_refresh
+        [[ ${__neo_cfg[theme]} != "$old" ]] && __neo_say '(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧' "The fleet runs ${__neo_cfg[theme]^^} now, so I switched too!" '艦隊配色に同期。'
+        return 0
+    fi
+    printf -v now '%(%s)T' -1
+    (( now - __neo_hub_wait > 20 )) && __neo_hub_wait=
+    return 0
+}
+
+__neo_sync() {
+    [[ ${__neo_cfg[hub]} == http* ]] || { printf 'neosh: no hub linked (neo link http://HUB:8088)\n' >&2; return 1; }
+    if ! __neo_hub_fetch; then
+        printf 'neosh: could not reach %s (is HEARTH running there?)\n' "${__neo_cfg[hub]}" >&2; return 1
+    fi
+    __neo_cfg_load; __neo_refresh
+    local n=${#__neo_theme_hub[@]} extra=
+    (( n )) && extra=", $n extra palette$( (( n == 1 )) || printf s)"
+    __neo_say '(｀・ω・´)ゞ' "Synced with the hub: theme ${__neo_cfg[theme]^^}, ${#__neo_greet[@]} greetings, ${#__neo_idle[@]} idle lines$extra." '同期完了！'
+    [[ ${__neo_cfg[hub_sync]} == on ]] || printf 'neosh: hub_sync is off, so the pack is saved but not applied\n'
+    return 0
+}
+
+__neo_link() {
+    local url=${1-}
+    if [[ -z $url ]]; then
+        printf 'hub=%s  hub_sync=%s\n' "${__neo_cfg[hub]}" "${__neo_cfg[hub_sync]}"; return 0
+    fi
+    if [[ $url == off ]]; then
+        __neo_cfg_save hub off || return 1
+        __neo_hub_wait=
+        rm -f -- "$__neo_pack" "$__neo_pack.new"
+        __neo_cfg_load; __neo_refresh
+        __neo_say '(・へ・)' 'Unlinked from the hub. Back to my own colours.' '接続解除。'
+        return 0
+    fi
+    [[ $url == *://* ]] || url=http://$url
+    url=${url%/}
+    __neo_valid hub "$url" || { __neo_clean "$url"; printf 'neosh: hub must look like http://host:port (got %s)\n' "$__neo_s" >&2; return 1; }
+    __neo_cfg_save hub "$url" || return 1
+    __neo_sync
+}
+
+# Tell the hub about a theme picked here. Returns 0 if the hub took it.
+__neo_hub_push() {
+    [[ ${__neo_cfg[hub]} == http* && ${__neo_cfg[hub_sync]} == on ]] || return 1
+    type -P curl >/dev/null || return 1
+    curl -fsS --proto '=http,https' -m 4 -o /dev/null -X POST -H 'X-Hearth: 1' -H 'Content-Type: application/json' \
+        --data "{\"theme\":\"$1\"}" -- "${__neo_cfg[hub]}/api/theme" 2>/dev/null && __neo_hub_fetch
 }
 
 # The config is *parsed*, never sourced: only known keys with validated values
@@ -146,7 +288,7 @@ __neo_cfg_load() {
             continue
         fi
         line=${line%%#*}
-        [[ $line =~ ^[[:space:]]*([a-z_]+)[[:space:]]*=[[:space:]]*([A-Za-z0-9_.-]*)[[:space:]]*$ ]] || continue
+        [[ $line =~ ^[[:space:]]*([a-z_]+)[[:space:]]*=[[:space:]]*([A-Za-z0-9_.:/-]*)[[:space:]]*$ ]] || continue
         k=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
         # theme= may name a custom theme defined further down: check it at the end
         if [[ $k == theme ]]; then theme=$v; continue; fi
@@ -154,10 +296,13 @@ __neo_cfg_load() {
         else printf 'neosh: config: ignoring bad value %s=%s\n' "$k" "$v" >&2; fi
     done < "$f"
     fi
+    __neo_pack_load   # hub palettes first, so theme= may name one of them
     if [[ -n $theme ]]; then
         if __neo_valid theme "$theme"; then __neo_cfg[theme]=$theme
         else printf 'neosh: config: unknown theme %s, using %s\n' "$theme" "${__neo_cfg[theme]}" >&2; fi
     fi
+    # a linked hub's fleet theme wins over the saved one
+    [[ -n $__neo_pack_theme ]] && __neo_cfg[theme]=$__neo_pack_theme
     # environment overrides for one-off sessions, e.g. NEOSH_THEME=sakura bash
     [[ -n ${NEOSH_THEME-} ]] && __neo_valid theme "$NEOSH_THEME" && __neo_cfg[theme]=$NEOSH_THEME
     [[ -n ${NEOSH_BOOT-} ]] && __neo_valid boot "$NEOSH_BOOT" && __neo_cfg[boot]=$NEOSH_BOOT
@@ -307,6 +452,15 @@ __neo_greeting() {
     printf -v h '%(%H)T' -1
     printf -v hm '%(%H:%M)T' -1
     h=$((10#$h))
+    if (( ${#__neo_greet[@]} )); then   # KAGARI's shared lines from the hub
+        local x u kao en jp
+        for x in "${__neo_greet[@]}"; do (( h < ${x%%|*} )) && break; done
+        IFS='|' read -r u kao en jp <<< "$x"
+        en=${en//'{time}'/$hm}; en=${en//'{where}'/shell}
+        __neo_say "$kao" "$en" "$jp"
+        (( h < 5 )) && printf -v __neo_late '%(%s)T' -1
+        return 0
+    fi
     if   (( h < 5 ));  then __neo_say '(￣o￣) zzz' "Still up at $hm, commander? I'll keep the hearth warm." '夜更かしですね…'
         printf -v __neo_late '%(%s)T' -1   # that counts as this hour's bedtime nag
     elif (( h < 11 )); then __neo_say '(｡•̀ᴗ-)✧' 'Good morning, commander! Shell warmed up and ready.' 'おはようございます！'
@@ -460,6 +614,7 @@ __neo_precmd() {
     fi
     local ran=${__neo_t0:+1}
     __neo_t0=
+    [[ -n $__neo_hub_wait ]] && __neo_hub_poll
 
     [[ ${__neo_cfg[prompt]} == on ]] || return "$st"
 
@@ -885,6 +1040,7 @@ __neo_themes() {
         __neo_sgr "${rgb[0]}"; a=$__neo_esc; __neo_sgr "${rgb[1]}"; b=$__neo_esc; __neo_sgr "${rgb[2]}"; c=$__neo_esc
         mark=' '; [[ $t == "${__neo_cfg[theme]}" ]] && mark=${__neo_g[arrow]}
         jp=custom; [[ -n ${__neo_theme_jp[$t]-} ]] && { jp=; (( __neo_utf8 )) && jp=${__neo_theme_jp[$t]}; }
+        [[ -n ${__neo_theme_hub[$t]-} ]] && { jp=hub; (( __neo_utf8 )) && jp+=" ${__neo_theme_hubjp[$t]-}"; }
         printf ' %s %s██%s██%s██%s  %-16s %s%s%s\n' "$mark" "$a" "$b" "$c" "${__neo_c[r]}" "${t^^}" "${__neo_c[dim]}" "$jp" "${__neo_c[r]}"
     done
     printf '\n   %sneo preview%s to see your prompt in each, %sneo theme add%s for your own%s\n' \
@@ -913,6 +1069,7 @@ __neo_preview() {
             mark=' '; [[ $t == "$active" ]] && mark=${__neo_g[arrow]}
             jp=; [[ -n ${__neo_theme_jp[$t]-} ]] && (( __neo_utf8 )) && jp=" ${__neo_theme_jp[$t]}"
             [[ -z ${__neo_theme_jp[$t]-} ]] && jp=' custom'
+            [[ -n ${__neo_theme_hub[$t]-} ]] && jp=' hub'
             printf '\n %s%s %s%s%s%s%s\n' "${__neo_c[a2]}" "$mark" "${__neo_c[b]}${__neo_c[a1]}" "${t^^}" "${__neo_c[r]}${__neo_c[dim]}" "$jp" "${__neo_c[r]}"
             if [[ -n ${EPOCHREALTIME-} ]]; then __neo_t0=$(( ${EPOCHREALTIME/[.,]/} - 4200000 )); else __neo_t0=1; fi
             false; __neo_precmd
@@ -954,6 +1111,7 @@ __neo_theme_rm() {
     local name=${1-}; name=${name,,}
     [[ $# -eq 1 ]] || { printf 'usage: neo theme rm NAME\n' >&2; return 2; }
     if [[ -n ${__neo_theme_jp[$name]+x} ]]; then printf 'neosh: %s is built in and stays\n' "$name" >&2; return 1; fi
+    if [[ -n ${__neo_theme_hub[$name]+x} ]]; then printf 'neosh: %s comes from the hub; remove it there (or neo link off)\n' "$name" >&2; return 1; fi
     if [[ -z ${__neo_theme_rgb[$name]+x} ]]; then __neo_clean "$name"; printf 'neosh: no custom theme %s\n' "$__neo_s" >&2; return 1; fi
     if [[ ${__neo_cfg[theme]} == "$name" ]]; then __neo_cfg_save theme hearth || return 1; fi
     __neo_cfg_write "theme.$name" '' || return 1
@@ -979,6 +1137,8 @@ neo set KEY VALUE;change a setting (see `neo config`)
 neo config;show settings and the config file
 neo reload;reload neosh in this shell
 neo nav;ask KAGARI how things are
+neo link [URL|off];follow a HEARTH hub's fleet theme and KAGARI
+neo sync;fetch the hub's theme and palettes now
 neo off;plain bash prompt for this session
 neo update [--pull];reinstall from your checkout (--pull: git pull first)
 neo version;version info
@@ -1031,8 +1191,13 @@ neo() {
             esac
             local t=${1,,}
             __neo_cfg_save theme "$t" || { printf 'neosh: themes: %s\n' "${__neo_theme_order[*]}" >&2; return 1; }
+            if [[ ${__neo_cfg[hub]} == http* && ${__neo_cfg[hub_sync]} == on ]]; then
+                if __neo_hub_push "$t"; then __neo_cfg_load
+                else printf 'neosh: hub unreachable: %s applies here until the hub answers again\n' "$t" >&2; __neo_pack_theme=; fi
+                __neo_cfg[theme]=$t
+            fi
             __neo_refresh
-            __neo_say '(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧' "Theme switched to ${t^^}!" "${__neo_theme_jp[$t]-}" ;;
+            __neo_say '(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧' "Theme switched to ${t^^}!" "${__neo_theme_jp[$t]-${__neo_theme_hubjp[$t]-}}" ;;
         preview) __neo_preview "$@" ;;
         boot)
             [[ -n ${1-} ]] || { printf 'boot=%s\n' "${__neo_cfg[boot]}"; return; }
@@ -1045,7 +1210,7 @@ neo() {
             if [[ $1 == prompt ]]; then printf 'neosh: open a new shell (or `neo reload`) to apply prompt=%s\n' "$2"; fi ;;
         config|conf)
             printf '%s# %s%s\n' "${__neo_c[dim]}" "$NEOSH_CONFIG" "${__neo_c[r]}"
-            local k; for k in theme boot color glyphs prompt navigator quips clock git git_dirty shlvl title spacing transient duration path_depth; do
+            local k; for k in theme boot color glyphs prompt navigator quips clock git git_dirty shlvl title spacing transient duration path_depth hub hub_sync; do
                 printf '%-11s = %s\n' "$k" "${__neo_cfg[$k]}"
             done
             for k in "${__neo_theme_order[@]:${#__neo_theme_builtin[@]}}"; do
@@ -1056,7 +1221,14 @@ neo() {
             # shellcheck source=/dev/null
             . "$NEOSH_HOME/neosh.bash" ;;
         nav)
-            __neo_greeting ;;
+            __neo_greeting
+            if (( ${#__neo_idle[@]} )); then
+                local kao en jp
+                IFS='|' read -r kao en jp <<< "${__neo_idle[RANDOM % ${#__neo_idle[@]}]}"
+                __neo_say "$kao" "$en" "$jp"
+            fi ;;
+        link) __neo_link "$@" ;;
+        sync) __neo_sync ;;
         off)
             PROMPT_COMMAND=${PROMPT_COMMAND#__neo_precmd}; PROMPT_COMMAND=${PROMPT_COMMAND#$'\n'}
             PS0=${PS0//"$__neo_stamp"/}
@@ -1076,7 +1248,7 @@ neo() {
 __neo_complete() {
     local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
     if (( COMP_CWORD == 1 )); then
-        mapfile -t COMPREPLY < <(compgen -W 'help status theme preview boot set config reload nav off update version uninstall' -- "$cur")
+        mapfile -t COMPREPLY < <(compgen -W 'help status theme preview boot set config reload nav link sync off update version uninstall' -- "$cur")
     elif [[ ${COMP_WORDS[1]} == preview ]]; then
         mapfile -t COMPREPLY < <(compgen -W "${__neo_theme_order[*]}" -- "$cur")
     elif (( COMP_CWORD == 3 )) && [[ ${COMP_WORDS[1]} == theme && $prev == @(rm|remove|del) ]]; then
@@ -1086,6 +1258,7 @@ __neo_complete() {
             theme) mapfile -t COMPREPLY < <(compgen -W "${__neo_theme_order[*]} add rm" -- "$cur") ;;
             boot)  mapfile -t COMPREPLY < <(compgen -W 'full compact off' -- "$cur") ;;
             set)   mapfile -t COMPREPLY < <(compgen -W "${!__neo_cfg[*]}" -- "$cur") ;;
+            link)  mapfile -t COMPREPLY < <(compgen -W 'off http://' -- "$cur") ;;
         esac
     elif (( COMP_CWORD == 3 )) && [[ ${COMP_WORDS[1]} == set ]]; then
         local opts
@@ -1139,3 +1312,4 @@ fi
 __neo_install_prompt
 __neo_tp_apply
 __neo_boot
+__neo_hub_bg
